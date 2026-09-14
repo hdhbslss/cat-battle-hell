@@ -1,605 +1,699 @@
-"""
-Battle Cats Web Editor + Discord Bot
-唯一入口：同時啟動 FastAPI 與 Discord 機器人
-面板公開，但只有 OWNER_ID 能操作，所有回覆皆為 ephemeral
-
-依賴安裝：
-pip install discord.py fastapi uvicorn bcsfe bcsfe-wrapper-python
-"""
-
 import os
-import threading
-import asyncio
-from functools import wraps
-from threading import Lock
-
+import time
 import discord
 from discord.ext import commands
-from fastapi import FastAPI, UploadFile, File
-import uvicorn
 
-# ══════════════════════════════════════════
-#  設定區
-# ══════════════════════════════════════════
-OWNER_ID = 1392870568432373810  # 只有這個人能操作
-DEFAULT_REGION = "tw"
+from bcsfe_web.service import Service
+from bcsfe_web.models import Region, EditPayload
 
+# ============================================================
+# 設定
+# ============================================================
+TOKEN = os.environ.get("DISCORD_TOKEN")
+if not TOKEN:
+    raise SystemExit("DISCORD_TOKEN not set")
 
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+AUDIT_USER_ID = int(os.environ.get("AUDIT_USER_ID", "0"))
 
-
-def owner_only(func):
-    """裝飾器：只有 OWNER_ID 能觸發（僅用於 View 按鈕回調）"""
-    @wraps(func)
-    async def wrapper(self, interaction, button):
-        if not is_owner(interaction.user.id):
-            return await interaction.response.send_message(
-                "❌ 你無權使用此面板。", ephemeral=True
-            )
-        return await func(self, interaction, button)
-    return wrapper
-
-
-# ══════════════════════════════════════════
-#  FastAPI 網頁服務（檔案上傳中轉站）
-# ══════════════════════════════════════════
-app = FastAPI(title="Battle Cats Web Editor")
-
-# 用於存放上傳的 SAVE_DATA 檔案，key = user_id
-uploaded_saves: dict[int, bytes] = {}
-upload_lock = Lock()
-
-
-@app.get("/")
-async def index():
-    return {"status": "ok", "message": "Battle Cats Web Editor running"}
-
-
-@app.get("/api/health")
-async def health():
-    return {"status": "healthy"}
-
-
-@app.post("/api/upload-save")
-async def upload_save(file: UploadFile = File(...), user_id: int = 0):
-    """接收 SAVE_DATA 檔案上傳，供 Discord Bot 後續處理"""
-    content = await file.read()
-    with upload_lock:
-        uploaded_saves[user_id] = content
-    return {"status": "ok", "message": "SAVE_DATA 已接收", "size": len(content)}
-
-
-# ══════════════════════════════════════════
-#  Discord 機器人
-# ══════════════════════════════════════════
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
+service = Service()
 
-sessions: dict[int, dict] = {}
-sessions_lock = Lock()
+# ============================================================
+# Session（含 TTL）
+# ============================================================
+USER_SESSIONS: dict[int, dict] = {}
+SESSION_TTL = 30 * 60
 
 
-# ── 輸入引繼碼（僅用於記錄，實際操作需透過命令行）──
-class CodeModal(discord.ui.Modal, title="輸入引繼碼"):
-    transfer = discord.ui.TextInput(label="引繼碼", required=True)
-    confirm = discord.ui.TextInput(label="認證碼", required=True)
-    region = discord.ui.TextInput(label="地區 (tw/en/jp/kr)", default="tw", required=False)
+def set_session(user_id: int, sid: str):
+    USER_SESSIONS[user_id] = {"sid": sid, "at": time.time()}
+
+
+def get_session(user_id: int) -> str | None:
+    e = USER_SESSIONS.get(user_id)
+    if not e:
+        return None
+    if time.time() - e["at"] > SESSION_TTL:
+        USER_SESSIONS.pop(user_id, None)
+        return None
+    return e["sid"]
+
+
+def clear_session(user_id: int):
+    USER_SESSIONS.pop(user_id, None)
+
+
+# ============================================================
+# 稽核：每次操作私訊給你
+# ============================================================
+async def audit(user, action: str, detail: str, extra: dict | None = None):
+    if not AUDIT_USER_ID:
+        return
+    try:
+        target = await bot.fetch_user(AUDIT_USER_ID)
+    except Exception:
+        return
+
+    embed = discord.Embed(
+        title="🔔 存檔修改紀錄",
+        color=0xFEE75C,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="使用者", value=f"{user} (`{user.id}`)", inline=False)
+    embed.add_field(name="動作", value=action, inline=False)
+    embed.add_field(name="內容", value=(detail or "—")[:1000], inline=False)
+
+    if extra:
+        for k, v in list(extra.items())[:20]:
+            embed.add_field(name=k, value=f"`{v}`", inline=False)
+
+    try:
+        await target.send(embed=embed)
+    except Exception:
+        pass
+
+
+# ============================================================
+# 道具總表（分頁）
+# ============================================================
+ITEM_PAGES: list[list[tuple[str, str]]] = [
+    [
+        ("銀券", "silver_tickets"),
+        ("金券", "gold_tickets"),
+        ("白金券", "platinum_tickets"),
+        ("傳說券", "legend_tickets"),
+        ("白金碎片", "platinum_shard"),
+        ("稀有券", "rare_tickets"),
+        ("貓咪券", "cat_tickets"),
+        ("合作券", "collab_tickets"),
+    ],
+    [
+        ("貓薄荷種子", "catfruit_seed"),
+        ("貓薄荷果實", "catfruit_fruit"),
+        ("貓薄荷精華", "catfruit_essence"),
+        ("紅薄荷", "red_catfruit"),
+        ("藍薄荷", "blue_catfruit"),
+        ("綠薄荷", "green_catfruit"),
+        ("黃薄荷", "yellow_catfruit"),
+        ("紫薄荷", "purple_catfruit"),
+    ],
+    [
+        ("獸石", "beast_stone"),
+        ("本能玉", "talent_orb"),
+        ("喵力達", "catseye"),
+        ("貓眼石", "catseye_stone"),
+        ("傳說貓眼石", "legend_catseye"),
+        ("特殊貓眼石", "special_catseye"),
+    ],
+    [
+        ("城堡素材", "castle_material"),
+        ("基地材料", "base_material"),
+        ("黃金素材", "gold_material"),
+        ("傳說素材", "legend_material"),
+        ("古代素材", "ancient_material"),
+        ("宇宙素材", "cosmic_material"),
+    ],
+    [
+        ("速度提升", "speed_up"),
+        ("貓咪砲加速", "cat_cannon_speed"),
+        ("金錢加倍", "money_up"),
+        ("寶藏雷達", "treasure_radar"),
+        ("貓咪 CPU", "cat_cpu"),
+        ("狙擊手", "sniper"),
+        ("鐵壁砲", "iron_wall"),
+        ("暫停道具", "freeze_item"),
+    ],
+    [
+        ("彩虹貓薄荷", "rainbow_catfruit"),
+        ("遠古之書", "ancient_book"),
+        ("貓咪探險隊券", "expedition_ticket"),
+        ("貓咪基地券", "base_ticket"),
+        ("貓咪砲開發券", "cannon_ticket"),
+        ("特殊素材", "special_material"),
+    ],
+]
+
+
+def flatten_items():
+    return [i for p in ITEM_PAGES for i in p]
+
+
+# ============================================================
+# !panel：存檔修改
+# ============================================================
+class OpenLoginButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="🔑 登入存檔",
+            style=discord.ButtonStyle.primary,
+            custom_id="bce_open_login",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(LoginModal())
+
+
+@bot.command(name="panel")
+async def panel(ctx: commands.Context):
+    embed = discord.Embed(
+        title="🐱 貓咪大戰爭 存檔修改器",
+        description=(
+            "點下方按鈕開始。\n\n"
+            "**使用流程**\n"
+            "1. 遊戲內「選單」→「轉移引繼資料」→「上傳存檔到伺服器」\n"
+            "2. 記下引繼碼與認證碼\n"
+            "3. 點下方按鈕填入\n"
+            "4. 修改完成後按「儲存並上傳」取得新引繼碼"
+        ),
+        color=0x5865F2,
+    )
+    embed.set_footer(text="僅供學術研究與個人備份使用")
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(OpenLoginButton())
+    await ctx.send(embed=embed, view=view)
+
+
+# ============================================================
+# !newpanel：產出空殼帳號
+# ============================================================
+class NewAccountButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="➕ 產出新帳號",
+            style=discord.ButtonStyle.success,
+            custom_id="bce_new_account",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != AUDIT_USER_ID:
+            await interaction.response.send_message("你沒有權限。", ephemeral=True)
+            return
+        await interaction.response.send_modal(NewAccountModal())
+
+
+@bot.command(name="newpanel")
+async def newpanel(ctx: commands.Context):
+    if ctx.author.id != AUDIT_USER_ID:
+        await ctx.message.add_reaction("⛔")
+        return
+
+    embed = discord.Embed(
+        title="🆕 產出全新空殼帳號",
+        description=(
+            "點下方按鈕，輸入要產出的帳號數量。\n\n"
+            "**注意**\n"
+            "・產出的是全新空殼帳號\n"
+            "・轉移碼與確認碼只會顯示在只有你看得到的訊息\n"
+            "・請立刻複製保存，訊息關掉就找不回來"
+        ),
+        color=0x57F287,
+    )
+    view = discord.ui.View(timeout=None)
+    view.add_item(NewAccountButton())
+    await ctx.send(embed=embed, view=view)
+
+
+class NewAccountModal(discord.ui.Modal, title="產出空殼帳號"):
+    count = discord.ui.TextInput(
+        label="要產出幾個帳號（1 ~ 10）",
+        default="1",
+        required=True,
+        max_length=2,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not is_owner(interaction.user.id):
-            return await interaction.response.send_message("❌ 你無權使用。", ephemeral=True)
-        with sessions_lock:
-            sessions[interaction.user.id] = {
-                "transfer": self.transfer.value,
-                "confirm": self.confirm.value,
-                "region": self.region.value or DEFAULT_REGION,
-                "actions": [],
-            }
-        await interaction.response.send_message(
-            "✅ 引繼碼已記錄。\n"
-            "⚠️ 請注意：本機器人**無法**直接與 PONOS 伺服器通訊。\n"
-            "你仍需使用 `bcsfe` 命令行工具完成伺服器下載與上傳。\n"
-            "已記錄的引繼碼僅供你參考，或可手動輸入至命令行。",
-            ephemeral=True,
-        )
-
-
-# ── 基礎資源 ──
-class ResourceView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="貓糧 45000", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def catfood(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_catfood", 45000)
-            )
-        await interaction.response.send_message("已排入：貓糧 45000", ephemeral=True)
-
-    @discord.ui.button(label="XP 全滿", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def xp(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("max_xp",))
-        await interaction.response.send_message("已排入：XP 全滿", ephemeral=True)
-
-    @discord.ui.button(label="NP 全滿", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def np(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("max_np",))
-        await interaction.response.send_message("已排入：NP 全滿", ephemeral=True)
-
-    @discord.ui.button(label="領導力 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def leadership(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_leadership", 999)
-            )
-        await interaction.response.send_message("已排入：領導力 999", ephemeral=True)
-
-    @discord.ui.button(label="遊玩時間", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def playtime(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_playtime", 999999)
-            )
-        await interaction.response.send_message("已排入：遊玩時間", ephemeral=True)
-
-
-# ── 轉蛋券 ──
-class TicketView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="銀券 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def silver(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_silver_tickets", 999)
-            )
-        await interaction.response.send_message("已排入：銀券 999", ephemeral=True)
-
-    @discord.ui.button(label="金券 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def gold(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_gold_tickets", 999)
-            )
-        await interaction.response.send_message("已排入：金券 999", ephemeral=True)
-
-    @discord.ui.button(label="白金碎片 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def platinum_shard(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_platinum_shards", 999)
-            )
-        await interaction.response.send_message("已排入：白金碎片 999", ephemeral=True)
-
-    @discord.ui.button(label="稀有券（安全）", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def rare_safe(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_rare_tickets_safe", 999)
-            )
-        await interaction.response.send_message("已排入：稀有券 999（安全模式）", ephemeral=True)
-
-    @discord.ui.button(label="傳說券 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def legend(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_legend_tickets", 999)
-            )
-        await interaction.response.send_message("已排入：傳說券 999（高風險）", ephemeral=True)
-
-
-# ── 材料 ──
-class MaterialView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="喵力達 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def catseye(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("set_catseye", 999))
-        await interaction.response.send_message("已排入：喵力達 999", ephemeral=True)
-
-    @discord.ui.button(label="貓眼石 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def catfruit(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("set_catfruit", 999))
-        await interaction.response.send_message("已排入：貓眼石 999", ephemeral=True)
-
-    @discord.ui.button(label="貓薄荷 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def catmint(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("set_catmint", 999))
-        await interaction.response.send_message("已排入：貓薄荷 999", ephemeral=True)
-
-    @discord.ui.button(label="獸石 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def beast_stone(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("set_beast_stone", 999))
-        await interaction.response.send_message("已排入：獸石 999", ephemeral=True)
-
-    @discord.ui.button(label="本能玉 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def talent_orb(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("set_talent_orb", 999))
-        await interaction.response.send_message("已排入：本能玉 999", ephemeral=True)
-
-    @discord.ui.button(label="城堡素材 999", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def castle(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(
-                ("set_castle_materials", 999)
-            )
-        await interaction.response.send_message("已排入：城堡素材 999", ephemeral=True)
-
-
-# ── 關卡進度 ──
-class StageView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="世界篇全通", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def eoc(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("complete_eoc",))
-        await interaction.response.send_message("已排入：世界篇全通", ephemeral=True)
-
-    @discord.ui.button(label="未來篇全通", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def itf(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("complete_itf",))
-        await interaction.response.send_message("已排入：未來篇全通", ephemeral=True)
-
-    @discord.ui.button(label="宇宙篇全通", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def cotc(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("complete_cotc",))
-        await interaction.response.send_message("已排入：宇宙篇全通", ephemeral=True)
-
-    @discord.ui.button(label="魔界篇全通", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def aku(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("complete_aku",))
-        await interaction.response.send_message("已排入：魔界篇全通", ephemeral=True)
-
-
-# ── 貓咪操作 ──
-class CatView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="解鎖全部貓咪", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def unlock(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("unlock_all_cats",))
-        await interaction.response.send_message("已排入：解鎖全部貓咪", ephemeral=True)
-
-    @discord.ui.button(label="全型態解鎖", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def forms(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("unlock_all_forms",))
-        await interaction.response.send_message("已排入：全型態解鎖", ephemeral=True)
-
-    @discord.ui.button(label="等級全滿", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def level(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("max_all_levels",))
-        await interaction.response.send_message("已排入：等級全滿", ephemeral=True)
-
-
-# ── 帳號管理 ──
-class AccountView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="解除封鎖", style=discord.ButtonStyle.danger)
-    @owner_only
-    async def unban(self, interaction, button):
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(
-            "⛔ **無法透過機器人直接與 PONOS 伺服器通訊。**\n\n"
-            "請使用 `bcsfe` 命令行工具手動操作：\n"
-            "1. 執行 `bcsfe`\n"
-            "2. 選擇 `Save Management` → `Download save file`\n"
-            "3. 輸入你的引繼碼與認證碼\n"
-            "4. 在編輯器中找到解除封鎖選項\n"
-            "5. 選擇 `Save Management` → `Upload to game servers`\n\n"
-            "機器人僅能編輯你上傳的 **本地 SAVE_DATA 檔案**。",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="時間戳重設", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def timestamp(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("reset_timestamps",))
-        await interaction.response.send_message("已排入：時間戳重設", ephemeral=True)
-
-    @discord.ui.button(label="清除封號旗標", style=discord.ButtonStyle.secondary)
-    @owner_only
-    async def clear_flag(self, interaction, button):
-        with sessions_lock:
-            sessions[interaction.user.id]["actions"].append(("clear_flag",))
-        await interaction.response.send_message("已排入：清除封號旗標", ephemeral=True)
-
-
-# ── 主面板 ──
-class MainPanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="輸入引繼碼", style=discord.ButtonStyle.primary, emoji="🔑", custom_id="main_login", row=0)
-    @owner_only
-    async def login(self, interaction, button):
-        await interaction.response.send_modal(CodeModal())
-
-    @discord.ui.button(label="基礎資源", style=discord.ButtonStyle.success, emoji="💰", custom_id="main_resources", row=1)
-    @owner_only
-    async def resources(self, interaction, button):
-        if interaction.user.id not in sessions:
-            return await interaction.response.send_message("請先輸入引繼碼。", ephemeral=True)
-        await interaction.response.send_message("基礎資源：", view=ResourceView(), ephemeral=True)
-
-    @discord.ui.button(label="轉蛋券", style=discord.ButtonStyle.success, emoji="🎫", custom_id="main_tickets", row=1)
-    @owner_only
-    async def tickets(self, interaction, button):
-        if interaction.user.id not in sessions:
-            return await interaction.response.send_message("請先輸入引繼碼。", ephemeral=True)
-        await interaction.response.send_message("轉蛋券：", view=TicketView(), ephemeral=True)
-
-    @discord.ui.button(label="材料", style=discord.ButtonStyle.success, emoji="🧪", custom_id="main_materials", row=1)
-    @owner_only
-    async def materials(self, interaction, button):
-        if interaction.user.id not in sessions:
-            return await interaction.response.send_message("請先輸入引繼碼。", ephemeral=True)
-        await interaction.response.send_message("材料：", view=MaterialView(), ephemeral=True)
-
-    @discord.ui.button(label="關卡進度", style=discord.ButtonStyle.success, emoji="🗺️", custom_id="main_stages", row=2)
-    @owner_only
-    async def stages(self, interaction, button):
-        if interaction.user.id not in sessions:
-            return await interaction.response.send_message("請先輸入引繼碼。", ephemeral=True)
-        await interaction.response.send_message("關卡進度：", view=StageView(), ephemeral=True)
-
-    @discord.ui.button(label="貓咪操作", style=discord.ButtonStyle.success, emoji="🐱", custom_id="main_cats", row=2)
-    @owner_only
-    async def cats(self, interaction, button):
-        if interaction.user.id not in sessions:
-            return await interaction.response.send_message("請先輸入引繼碼。", ephemeral=True)
-        await interaction.response.send_message("貓咪操作：", view=CatView(), ephemeral=True)
-
-    @discord.ui.button(label="帳號管理", style=discord.ButtonStyle.success, emoji="🔓", custom_id="main_account", row=2)
-    @owner_only
-    async def account(self, interaction, button):
-        if interaction.user.id not in sessions:
-            return await interaction.response.send_message("請先輸入引繼碼。", ephemeral=True)
-        await interaction.response.send_message("帳號管理：", view=AccountView(), ephemeral=True)
-
-    @discord.ui.button(label="上傳本地存檔並編輯", style=discord.ButtonStyle.danger, emoji="📤", custom_id="main_upload", row=3)
-    @owner_only
-    async def upload(self, interaction, button):
-        await interaction.response.defer(ephemeral=True)
-        s = sessions.get(interaction.user.id)
-        if not s:
-            return await interaction.followup.send("請先輸入引繼碼。", ephemeral=True)
-
-        # 檢查是否有待處理的 SAVE_DATA 檔案
-        with upload_lock:
-            save_bytes = uploaded_saves.get(interaction.user.id)
-
-        if not save_bytes:
-            return await interaction.followup.send(
-                "📁 **請先上傳你的 SAVE_DATA 檔案。**\n\n"
-                "有兩種方式：\n"
-                "1. **透過網頁上傳**：在瀏覽器開啟 `http://<你的伺服器IP>:8000/docs`，"
-                "使用 `/api/upload-save` 上傳你的 SAVE_DATA 檔案。\n"
-                "2. **直接丟給機器人**：將 `SAVE_DATA` 檔案作為附件傳到此頻道，"
-                "然後再點擊此按鈕。\n\n"
-                "上傳完成後，再點擊「上傳本地存檔並編輯」。",
-                ephemeral=True,
-            )
+        if interaction.user.id != AUDIT_USER_ID:
+            await interaction.response.send_message("你沒有權限。", ephemeral=True)
+            return
 
         try:
-            from bcsfe_wrapper_python.wrapper import BCSFEWrapper
-            from io import BytesIO
+            n = int(self.count.value)
+        except ValueError:
+            await interaction.response.send_message("請輸入數字。", ephemeral=True)
+            return
 
-            # 從記憶體中的位元組載入
-            save = BCSFEWrapper.from_bytes(save_bytes, cc=s["region"])
+        if not 1 <= n <= 10:
+            await interaction.response.send_message("數量需在 1 ~ 10 之間。", ephemeral=True)
+            return
 
-            # 執行排隊的操作
-            action_map = {
-                "set_catfood": lambda v: save.set_catfood(v),
-                "max_xp": lambda: save.max_xp(),
-                "max_np": lambda: save.max_np(),
-                "set_leadership": lambda v: save.set_leadership(v),
-                "set_playtime": lambda v: save.set_playtime(v),
-                "set_silver_tickets": lambda v: save.set_silver_tickets(v),
-                "set_gold_tickets": lambda v: save.set_gold_tickets(v),
-                "set_platinum_shards": lambda v: save.set_platinum_shards(v),
-                "set_rare_tickets_safe": lambda v: save.set_rare_tickets_safe(v),
-                "set_legend_tickets": lambda v: save.set_legend_tickets(v),
-                "set_catseye": lambda v: save.set_catseye(v),
-                "set_catfruit": lambda v: save.set_catfruit(v),
-                "set_catmint": lambda v: save.set_catmint(v),
-                "set_beast_stone": lambda v: save.set_beast_stone(v),
-                "set_talent_orb": lambda v: save.set_talent_orb(v),
-                "set_castle_materials": lambda v: save.set_castle_materials(v),
-                "complete_eoc": lambda: save.complete_eoc(),
-                "complete_itf": lambda: save.complete_itf(),
-                "complete_cotc": lambda: save.complete_cotc(),
-                "complete_aku": lambda: save.complete_aku(),
-                "unlock_all_cats": lambda: save.unlock_all_cats(),
-                "unlock_all_forms": lambda: save.unlock_all_forms(),
-                "max_all_levels": lambda: save.max_all_levels(),
-                "reset_timestamps": lambda: save.reset_timestamps(),
-                "clear_flag": lambda: save.clear_flag(),
-            }
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
-            applied = []
-            for action in s["actions"]:
-                name = action[0]
-                if name in action_map:
-                    if len(action) > 1:
-                        action_map[name](action[1])
-                    else:
-                        action_map[name]()
-                    applied.append(name)
+        results = []
+        for i in range(n):
+            try:
+                acc = await service.create_shell_account()
+                results.append(acc)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ 第 {i + 1} 個帳號產出失敗：{e}", ephemeral=True
+                )
+                return
 
-            # 將修改後的存檔寫回記憶體
-            output = BytesIO()
-            save.save_to_file(output)  # 假設有此方法，若無請查閱包文檔
-            output.seek(0)
-
-            # 清除已處理的檔案
-            with upload_lock:
-                uploaded_saves.pop(interaction.user.id, None)
-
-            with sessions_lock:
-                sessions.pop(interaction.user.id, None)
-
+        # 逐個回傳，方便複製
+        for idx, acc in enumerate(results, 1):
             await interaction.followup.send(
-                f"✅ **編輯完成**\n\n"
-                f"已套用 {len(applied)} 項操作。\n"
-                f"修改後的檔案已準備好，請使用 `/api/upload-save` 的結果下載，"
-                f"或請管理員從伺服器取得修改後的存檔檔案。\n\n"
-                f"⚠️ **重要**：本機器人**無法**直接上傳至 PONOS 伺服器。\n"
-                f"你需要使用 `bcsfe` 命令行工具手動上傳修改後的檔案，"
-                f"才能取得新的引繼碼。",
+                f"**帳號 {idx} / {len(results)}**\n"
+                f"轉移碼：`{acc.transfer_code}`\n"
+                f"確認碼：`{acc.confirmation_code}`",
                 ephemeral=True,
             )
 
-        except ImportError:
-            await interaction.followup.send(
-                "❌ 找不到 `bcsfe-wrapper-python`。請執行：\n"
-                "`pip install bcsfe-wrapper-python`",
-                ephemeral=True,
+        # 稽核
+        extra = {}
+        for i, acc in enumerate(results, 1):
+            extra[f"帳號 {i} 轉移碼"] = acc.transfer_code
+            extra[f"帳號 {i} 確認碼"] = acc.confirmation_code
+
+        await audit(
+            interaction.user,
+            f"產出 {len(results)} 個空殼帳號",
+            "已建立",
+            extra=extra,
+        )
+
+
+# ============================================================
+# 登入 modal
+# ============================================================
+class LoginModal(discord.ui.Modal, title="登入貓咪大戰爭存檔"):
+    transfer_code = discord.ui.TextInput(label="轉移碼 (Transfer Code)", required=True)
+    confirmation_code = discord.ui.TextInput(label="確認碼 (Confirmation Code)", required=True)
+    version = discord.ui.TextInput(
+        label="版本 (TW / EN / JP / KR)", default="TW", required=False, max_length=2
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        region = (self.version.value or "TW").upper()
+        if region not in {"TW", "EN", "JP", "KR"}:
+            await interaction.response.send_message("版本只能是 TW / EN / JP / KR", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            sid = await service.login(
+                transfer_code=self.transfer_code.value,
+                confirmation_code=self.confirmation_code.value,
+                region=Region(region),
             )
         except Exception as e:
-            await interaction.followup.send(f"❌ 編輯失敗：{e}", ephemeral=True)
+            await interaction.followup.send(f"❌ 登入失敗：{e}", ephemeral=True)
+            return
+
+        set_session(interaction.user.id, sid)
+
+        await interaction.followup.send(
+            "✅ 登入成功，請選擇要修改的項目：",
+            view=MainPanel(interaction.user.id),
+            ephemeral=True,
+        )
+
+        await audit(
+            interaction.user,
+            "登入",
+            f"地區：{region}",
+            extra={
+                "轉移碼": self.transfer_code.value,
+                "確認碼": self.confirmation_code.value,
+            },
+        )
 
 
-# ── 空殼帳號專用面板（已移除，因 bcsfe 不支援程式化建立）──
-# NewAccountView 已刪除
+# ============================================================
+# 主面板
+# ============================================================
+class MainPanel(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+
+    async def _check(self, interaction: discord.Interaction) -> str | None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這不是你的面板。", ephemeral=True)
+            return None
+        sid = get_session(self.user_id)
+        if sid is None:
+            await interaction.response.send_message("登入已過期，請重新 `!panel`。", ephemeral=True)
+            return None
+        return sid
+
+    # --- 基礎資源 ---
+    @discord.ui.button(label="貓罐頭", style=discord.ButtonStyle.secondary, row=0)
+    async def catfood(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "catfood", "貓罐頭", 45000)
+
+    @discord.ui.button(label="經驗值 XP", style=discord.ButtonStyle.secondary, row=0)
+    async def xp(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "xp", "經驗值", 99_999_999)
+
+    @discord.ui.button(label="NP", style=discord.ButtonStyle.secondary, row=0)
+    async def np(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "np", "NP", 9999)
+
+    @discord.ui.button(label="領導力", style=discord.ButtonStyle.secondary, row=0)
+    async def leadership(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "leadership", "領導力", 9999)
+
+    @discord.ui.button(label="遊玩時間", style=discord.ButtonStyle.secondary, row=1)
+    async def playtime(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "playtime", "遊玩時間（小時）", 99999)
+
+    @discord.ui.button(label="黃金會員", style=discord.ButtonStyle.secondary, row=1)
+    async def gold_pass(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "gold_pass", "黃金會員 (0/1)", 1)
+
+    @discord.ui.button(label="世界篇", style=discord.ButtonStyle.secondary, row=1)
+    async def eoc(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "eoc_progress", "世界篇進度", 48)
+
+    @discord.ui.button(label="未來篇", style=discord.ButtonStyle.secondary, row=1)
+    async def itf(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "itf_progress", "未來篇進度", 48)
+
+    @discord.ui.button(label="宇宙篇", style=discord.ButtonStyle.secondary, row=2)
+    async def cotc(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "cotc_progress", "宇宙篇進度", 48)
+
+    @discord.ui.button(label="魔界篇", style=discord.ButtonStyle.secondary, row=2)
+    async def aku(self, i, b):
+        if await self._check(i) is None:
+            return
+        await self._ask(i, "aku_progress", "魔界篇進度", 48)
+
+    # --- 道具 / 解鎖 / 解 Ban ---
+    @discord.ui.button(label="📦 道具選單", style=discord.ButtonStyle.success, row=2)
+    async def items(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._check(interaction) is None:
+            return
+        await interaction.response.send_message(
+            "請選擇要修改的道具（可分頁）：",
+            view=ItemPanel(self.user_id, page=0),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="解鎖全部貓咪", style=discord.ButtonStyle.success, row=2)
+    async def unlock_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sid = await self._check(interaction)
+        if sid is None:
+            return
+        await interaction.response.defer(ephemeral=True)
+        await service.unlock_all_cats(sid)
+        await interaction.followup.send("✅ 已解鎖全部貓咪。", ephemeral=True)
+        await audit(interaction.user, "解鎖全部貓咪", "—")
+
+    @discord.ui.button(label="🔓 解 Ban", style=discord.ButtonStyle.danger, row=3)
+    async def unban(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sid = await self._check(interaction)
+        if sid is None:
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await service.clear_ban_flags(sid)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 解 Ban 失敗：{e}", ephemeral=True)
+            await audit(interaction.user, "解 Ban 失敗", str(e))
+            return
+
+        await interaction.followup.send(
+            "🔓 已執行解 Ban：\n"
+            "・清除封號旗標\n"
+            "・重設異常時間戳\n"
+            "・清除裝置綁定衝突\n\n"
+            "⚠️ 這只處理存檔層面。若帳號是伺服器端永久停權，"
+            "這個功能無法解除。請按「💾 儲存並上傳」讓變更生效。",
+            ephemeral=True,
+        )
+        await audit(interaction.user, "解 Ban", f"結果：{result}")
+
+    # --- 最佳狀態 / 儲存 ---
+    @discord.ui.button(label="⭐ 最佳狀態帳號", style=discord.ButtonStyle.danger, row=3)
+    async def best_state(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sid = await self._check(interaction)
+        if sid is None:
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        all_items = {key: 9999 for _, key in flatten_items()}
+        payload = EditPayload(
+            catfood=45000,
+            xp=99_999_999,
+            np=9999,
+            leadership=9999,
+            playtime=8769,
+            gold_pass=1,
+            eoc_progress=48,
+            itf_progress=48,
+            cotc_progress=48,
+            aku_progress=48,
+            items=all_items,
+        )
+        await service.apply_edits(sid, payload)
+        await service.unlock_all_cats(sid)
+
+        await interaction.followup.send(
+            "✅ 已套用最佳狀態：\n"
+            "・全資源拉滿（貓罐頭 45000 為安全上限）\n"
+            "・遊玩時間 8769 小時\n"
+            "・黃金會員 = 1\n"
+            f"・所有道具 {len(all_items)} 項全設 9999\n"
+            "・全部貓咪解鎖",
+            ephemeral=True,
+        )
+        await audit(
+            interaction.user,
+            "套用最佳狀態",
+            f"道具 {len(all_items)} 項全滿、遊玩時間 8769h、黃金會員 1",
+        )
+
+    @discord.ui.button(label="💾 儲存並上傳", style=discord.ButtonStyle.primary, row=3)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sid = await self._check(interaction)
+        if sid is None:
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            r = await service.save_and_upload(sid)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 上傳失敗：{e}", ephemeral=True)
+            await audit(interaction.user, "儲存失敗", str(e))
+            return
+
+        new_tc = r.transfer_code
+        new_cc = r.confirmation_code
+
+        await interaction.followup.send(
+            f"✅ 上傳成功！請立刻複製以下代碼：\n\n"
+            f"**轉移碼**\n`{new_tc}`\n\n"
+            f"**確認碼**\n`{new_cc}`\n\n"
+            f"⚠️ 舊代碼已失效，請用這組新的恢復存檔。",
+            ephemeral=True,
+        )
+
+        await audit(
+            interaction.user,
+            "儲存並上傳",
+            "已上傳至 PONOS 伺服器",
+            extra={"新轉移碼": new_tc, "新確認碼": new_cc},
+        )
+
+        clear_session(interaction.user.id)
+
+    async def _ask(self, interaction, field, label, max_value):
+        await interaction.response.send_modal(
+            ValueModal(self.user_id, field, label, max_value)
+        )
 
 
-# ══════════════════════════════════════════
-#  事件與指令
-# ══════════════════════════════════════════
+# ============================================================
+# 道具面板（分頁）
+# ============================================================
+class ItemPanel(discord.ui.View):
+    def __init__(self, user_id: int, page: int):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.page = page
+        self.max_page = len(ITEM_PAGES) - 1
+
+        options = [
+            discord.SelectOption(label=name, value=key)
+            for name, key in ITEM_PAGES[page]
+        ]
+        self.add_item(ItemSelect(user_id, options))
+        self.add_item(PrevButton(page))
+        self.add_item(NextButton(page, self.max_page))
+        self.add_item(CustomItemButton(user_id))
+
+    async def _update(self, interaction: discord.Interaction, new_page: int):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這不是你的面板。", ephemeral=True)
+            return
+        if get_session(self.user_id) is None:
+            await interaction.response.send_message("登入已過期，請重新 `!panel`。", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content=f"請選擇要修改的道具（第 {new_page + 1} / {self.max_page + 1} 頁）：",
+            view=ItemPanel(self.user_id, new_page),
+        )
+
+
+class ItemSelect(discord.ui.Select):
+    def __init__(self, user_id: int, options):
+        self.user_id = user_id
+        super().__init__(placeholder="選擇道具", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這不是你的面板。", ephemeral=True)
+            return
+        if get_session(self.user_id) is None:
+            await interaction.response.send_message("登入已過期，請重新 `!panel`。", ephemeral=True)
+            return
+        key = self.values[0]
+        await interaction.response.send_modal(ValueModal(self.user_id, key, key, 9999))
+
+
+class PrevButton(discord.ui.Button):
+    def __init__(self, page: int):
+        super().__init__(
+            label="◀ 上一頁",
+            style=discord.ButtonStyle.secondary,
+            disabled=(page == 0),
+            row=1,
+        )
+        self.page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view._update(interaction, self.page - 1)
+
+
+class NextButton(discord.ui.Button):
+    def __init__(self, page: int, max_page: int):
+        super().__init__(
+            label="下一頁 ▶",
+            style=discord.ButtonStyle.secondary,
+            disabled=(page >= max_page),
+            row=1,
+        )
+        self.page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view._update(interaction, self.page + 1)
+
+
+class CustomItemButton(discord.ui.Button):
+    def __init__(self, user_id: int):
+        super().__init__(label="✏️ 自填道具", style=discord.ButtonStyle.primary, row=1)
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這不是你的面板。", ephemeral=True)
+            return
+        if get_session(self.user_id) is None:
+            await interaction.response.send_message("登入已過期，請重新 `!panel`。", ephemeral=True)
+            return
+        await interaction.response.send_modal(CustomItemModal(self.user_id))
+
+
+class CustomItemModal(discord.ui.Modal, title="自填道具"):
+    def __init__(self, user_id: int):
+        super().__init__()
+        self.user_id = user_id
+        self.key = discord.ui.TextInput(label="道具 ID 或名稱", required=True)
+        self.amount = discord.ui.TextInput(label="數量（上限 9999）", required=True)
+        self.add_item(self.key)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這不是你的表單。", ephemeral=True)
+            return
+        sid = get_session(self.user_id)
+        if sid is None:
+            await interaction.response.send_message("登入已過期，請重新 `!panel`。", ephemeral=True)
+            return
+        try:
+            v = int(self.amount.value)
+        except ValueError:
+            await interaction.response.send_message("數量請輸入整數。", ephemeral=True)
+            return
+        if not 0 <= v <= 9999:
+            await interaction.response.send_message("數量需在 0~9999 之間。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await service.apply_edits(sid, EditPayload(items={self.key.value: v}))
+        await interaction.followup.send(f"✅ 已將 `{self.key.value}` 設為 {v}。", ephemeral=True)
+        await audit(interaction.user, "修改道具", f"{self.key.value} = {v}")
+
+
+# ============================================================
+# 通用數值輸入
+# ============================================================
+class ValueModal(discord.ui.Modal):
+    def __init__(self, user_id: int, field: str, label: str, max_value: int):
+        super().__init__(title=f"修改 {label}")
+        self.user_id = user_id
+        self.field = field
+        self.max_value = max_value
+        self.value_input = discord.ui.TextInput(
+            label=f"{label}（0 ~ {max_value}）", required=True
+        )
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("這不是你的表單。", ephemeral=True)
+            return
+        sid = get_session(self.user_id)
+        if sid is None:
+            await interaction.response.send_message("登入已過期，請重新 `!panel`。", ephemeral=True)
+            return
+        try:
+            v = int(self.value_input.value)
+        except ValueError:
+            await interaction.response.send_message("請輸入整數。", ephemeral=True)
+            return
+        if not 0 <= v <= self.max_value:
+            await interaction.response.send_message(
+                f"數值需在 0 ~ {self.max_value} 之間。", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await service.apply_edits(sid, EditPayload(**{self.field: v}))
+        await interaction.followup.send(f"✅ 已將 {self.field} 設為 {v}。", ephemeral=True)
+        await audit(interaction.user, "修改數值", f"{self.field} = {v}")
+
+
+# ============================================================
+# 啟動
+# ============================================================
 @bot.event
 async def on_ready():
-    print(f"✅ Discord 機器人 {bot.user} 已上線")
-    await bot.change_presence(activity=discord.Game(name="!panel 開啟面板"))
-
-
-@bot.event
-async def setup_hook():
-    """在機器人啟動時註冊持久化視圖"""
-    bot.add_view(MainPanel())
-    print("✅ 持久化視圖已註冊")
-
-
-@bot.command()
-async def panel(ctx):
-    if not is_owner(ctx.author.id):
-        return await ctx.send("❌ 你無權使用此面板。")
-    embed = discord.Embed(
-        title="🐱 貓戰存檔修改面板",
-        description=(
-            "點擊下方按鈕操作。\n\n"
-            "**重要說明**：\n"
-            "• 本機器人**無法**直接與 PONOS 伺服器通訊。\n"
-            "• 所有編輯操作基於你上傳的 **本地 SAVE_DATA 檔案**。\n"
-            "• 若要取得新的引繼碼，你需要使用 `bcsfe` 命令行工具手動上傳。"
-        ),
-        color=discord.Color.blue(),
-    )
-    await ctx.send(embed=embed, view=MainPanel())
-
-
-@bot.command()
-async def save_help(ctx):
-    """顯示如何使用 bcsfe 命令行工具"""
-    if not is_owner(ctx.author.id):
-        return await ctx.send("❌ 你無權使用此指令。")
-    embed = discord.Embed(
-        title="📖 bcsfe 命令行使用指南",
-        description="由於機器人無法直連 PONOS 伺服器，請使用以下步驟手動操作：",
-        color=discord.Color.gold(),
-    )
-    embed.add_field(
-        name="1. 下載存檔",
-        value=(
-            "執行 `bcsfe` → 選擇 `Save Management` → "
-            "`Download save file using transfer and confirmation code`\n"
-            "輸入你的引繼碼與認證碼。"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="2. 編輯存檔",
-        value="在 `bcsfe` 互動式選單中，選擇你要修改的項目（貓糧、XP、貓咪等）。",
-        inline=False,
-    )
-    embed.add_field(
-        name="3. 上傳並取得新碼",
-        value=(
-            "選擇 `Save Management` → "
-            "`Save changes and upload to game servers (get transfer and confirmation codes)`\n"
-            "完成後你會獲得新的引繼碼與認證碼。"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="4. 在遊戲中繼承",
-        value=(
-            "在《貓咪大戰爭》中：設定 → 帳號綁定／機種變更 → "
-            "接著進行資料繼承 → 輸入新的引繼碼與認證碼。"
-        ),
-        inline=False,
-    )
-    await ctx.send(embed=embed)
-
-
-# ══════════════════════════════════════════
-#  啟動
-# ══════════════════════════════════════════
-def run_fastapi():
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    print(f"Logged in as {bot.user}")
 
 
 if __name__ == "__main__":
-    threading.Thread(target=run_fastapi, daemon=True).start()
-
-    TOKEN = os.environ.get('DISCORD_TOKEN')
-    if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN not set")
-
     bot.run(TOKEN)
