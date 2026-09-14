@@ -3,4 +3,3 @@ fastapi
 uvicorn
 pydantic
 requests
-git+https://github.com/thomas950321/BattleCats-Web-Editor.git
