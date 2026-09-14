@@ -1,5 +1,5 @@
-discord.py>=2.3.0
+discord.py>=2.3.2
 fastapi
 uvicorn
-bcsfe
-python-multipart
+pydantic
+requests
